@@ -11,34 +11,40 @@
  * - Support dynamic model selection across providers
  */
 
-import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
-import { getCredential } from '../../shared/EnvManager.js';
-import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../shared/paths.js';
-import { logger } from '../../utils/logger.js';
-import { ModeManager } from '../domain/ModeManager.js';
-import type { ActiveSession, ConversationMessage } from '../worker-types.js';
-import { DatabaseManager } from './DatabaseManager.js';
-import { SessionManager } from './SessionManager.js';
+import {
+  buildContinuationPrompt,
+  buildInitPrompt,
+  buildObservationPrompt,
+  buildSummaryPrompt,
+} from "../../sdk/prompts.js";
+import { getCredential } from "../../shared/EnvManager.js";
+import { SettingsDefaultsManager } from "../../shared/SettingsDefaultsManager.js";
+import { USER_SETTINGS_PATH } from "../../shared/paths.js";
+import { logger } from "../../utils/logger.js";
+import { ModeManager } from "../domain/ModeManager.js";
+import type { ActiveSession, ConversationMessage } from "../worker-types.js";
+import { DatabaseManager } from "./DatabaseManager.js";
+import { SessionManager } from "./SessionManager.js";
 import {
   isAbortError,
   processAgentResponse,
   shouldFallbackToClaude,
   type FallbackAgent,
-  type WorkerRef
-} from './agents/index.js';
+  type WorkerRef,
+} from "./agents/index.js";
 
-// OpenRouter API endpoint
-const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+// OpenRouter API endpoint — overridable via CLAUDE_MEM_OPENROUTER_BASE_URL for local models (Ollama, LM Studio, etc.)
+const DEFAULT_OPENROUTER_API_URL =
+  "https://openrouter.ai/api/v1/chat/completions";
 
 // Context window management constants (defaults, overridable via settings)
-const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
-const DEFAULT_MAX_ESTIMATED_TOKENS = 100000;  // ~100k tokens max context (safety limit)
-const CHARS_PER_TOKEN_ESTIMATE = 4;  // Conservative estimate: 1 token = 4 chars
+const DEFAULT_MAX_CONTEXT_MESSAGES = 20; // Maximum messages to keep in conversation history
+const DEFAULT_MAX_ESTIMATED_TOKENS = 100000; // ~100k tokens max context (safety limit)
+const CHARS_PER_TOKEN_ESTIMATE = 4; // Conservative estimate: 1 token = 4 chars
 
 // OpenAI-compatible message format
 interface OpenAIMessage {
-  role: 'user' | 'assistant' | 'system';
+  role: "user" | "assistant" | "system";
   content: string;
 }
 
@@ -83,34 +89,64 @@ export class OpenRouterAgent {
    * Start OpenRouter agent for a session
    * Uses multi-turn conversation to maintain context across messages
    */
-  async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
+  async startSession(
+    session: ActiveSession,
+    worker?: WorkerRef,
+  ): Promise<void> {
     try {
       // Get OpenRouter configuration
-      const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
+      const { apiKey, model, baseUrl, siteUrl, appName } =
+        this.getOpenRouterConfig();
 
-      if (!apiKey) {
-        throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
+      // Skip API key check for local models (Ollama, LM Studio)
+      const isLocal = baseUrl !== DEFAULT_OPENROUTER_API_URL;
+      if (!apiKey && !isLocal) {
+        throw new Error(
+          "OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.",
+        );
       }
 
       // Generate synthetic memorySessionId (OpenRouter is stateless, doesn't return session IDs)
       if (!session.memorySessionId) {
         const syntheticMemorySessionId = `openrouter-${session.contentSessionId}-${Date.now()}`;
         session.memorySessionId = syntheticMemorySessionId;
-        this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
-        logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=OpenRouter`);
+        this.dbManager
+          .getSessionStore()
+          .updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+        logger.info(
+          "SESSION",
+          `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=OpenRouter`,
+        );
       }
 
       // Load active mode
       const mode = ModeManager.getInstance().getActiveMode();
 
       // Build initial prompt
-      const initPrompt = session.lastPromptNumber === 1
-        ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode)
-        : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode);
+      const initPrompt =
+        session.lastPromptNumber === 1
+          ? buildInitPrompt(
+              session.project,
+              session.contentSessionId,
+              session.userPrompt,
+              mode,
+            )
+          : buildContinuationPrompt(
+              session.userPrompt,
+              session.lastPromptNumber,
+              session.contentSessionId,
+              mode,
+            );
 
       // Add to conversation history and query OpenRouter with full context
-      session.conversationHistory.push({ role: 'user', content: initPrompt });
-      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+      session.conversationHistory.push({ role: "user", content: initPrompt });
+      const initResponse = await this.queryOpenRouterMultiTurn(
+        session.conversationHistory,
+        apiKey,
+        model,
+        siteUrl,
+        appName,
+      );
 
       if (initResponse.content) {
         // Add response to conversation history
@@ -118,7 +154,7 @@ export class OpenRouterAgent {
 
         // Track token usage
         const tokensUsed = initResponse.tokensUsed || 0;
-        session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);  // Rough estimate
+        session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7); // Rough estimate
         session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
 
         // Process response using shared ResponseProcessor (no original timestamp for init - not from queue)
@@ -130,21 +166,27 @@ export class OpenRouterAgent {
           worker,
           tokensUsed,
           null,
-          'OpenRouter',
-          undefined  // No lastCwd yet - before message processing
+          "OpenRouter",
+          undefined, // No lastCwd yet - before message processing
         );
       } else {
-        logger.error('SDK', 'Empty OpenRouter init response - session may lack context', {
-          sessionId: session.sessionDbId,
-          model
-        });
+        logger.error(
+          "SDK",
+          "Empty OpenRouter init response - session may lack context",
+          {
+            sessionId: session.sessionDbId,
+            model,
+          },
+        );
       }
 
       // Track lastCwd from messages for CLAUDE.md generation
       let lastCwd: string | undefined;
 
       // Process pending messages
-      for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+      for await (const message of this.sessionManager.getMessageIterator(
+        session.sessionDbId,
+      )) {
         // CLAIM-CONFIRM: Track message ID for confirmProcessed() after successful storage
         // The message is now in 'processing' status in DB until ResponseProcessor calls confirmProcessed()
         session.processingMessageIds.push(message._persistentId);
@@ -156,7 +198,7 @@ export class OpenRouterAgent {
         // Capture earliest timestamp BEFORE processing (will be cleared after)
         const originalTimestamp = session.earliestPendingTimestamp;
 
-        if (message.type === 'observation') {
+        if (message.type === "observation") {
           // Update last prompt number
           if (message.prompt_number !== undefined) {
             session.lastPromptNumber = message.prompt_number;
@@ -165,7 +207,9 @@ export class OpenRouterAgent {
           // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
           // This prevents wasting tokens when we won't be able to store the result anyway
           if (!session.memorySessionId) {
-            throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
+            throw new Error(
+              "Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.",
+            );
           }
 
           // Build observation prompt
@@ -175,12 +219,22 @@ export class OpenRouterAgent {
             tool_input: JSON.stringify(message.tool_input),
             tool_output: JSON.stringify(message.tool_response),
             created_at_epoch: originalTimestamp ?? Date.now(),
-            cwd: message.cwd
+            cwd: message.cwd,
           });
 
           // Add to conversation history and query OpenRouter with full context
-          session.conversationHistory.push({ role: 'user', content: obsPrompt });
-          const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+          session.conversationHistory.push({
+            role: "user",
+            content: obsPrompt,
+          });
+          const obsResponse = await this.queryOpenRouterMultiTurn(
+            session.conversationHistory,
+            apiKey,
+            model,
+            siteUrl,
+            appName,
+            baseUrl,
+          );
 
           let tokensUsed = 0;
           if (obsResponse.content) {
@@ -194,35 +248,49 @@ export class OpenRouterAgent {
 
           // Process response using shared ResponseProcessor
           await processAgentResponse(
-            obsResponse.content || '',
+            obsResponse.content || "",
             session,
             this.dbManager,
             this.sessionManager,
             worker,
             tokensUsed,
             originalTimestamp,
-            'OpenRouter',
-            lastCwd
+            "OpenRouter",
+            lastCwd,
           );
-
-        } else if (message.type === 'summarize') {
+        } else if (message.type === "summarize") {
           // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
           if (!session.memorySessionId) {
-            throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
+            throw new Error(
+              "Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.",
+            );
           }
 
           // Build summary prompt
-          const summaryPrompt = buildSummaryPrompt({
-            id: session.sessionDbId,
-            memory_session_id: session.memorySessionId,
-            project: session.project,
-            user_prompt: session.userPrompt,
-            last_assistant_message: message.last_assistant_message || ''
-          }, mode);
+          const summaryPrompt = buildSummaryPrompt(
+            {
+              id: session.sessionDbId,
+              memory_session_id: session.memorySessionId,
+              project: session.project,
+              user_prompt: session.userPrompt,
+              last_assistant_message: message.last_assistant_message || "",
+            },
+            mode,
+          );
 
           // Add to conversation history and query OpenRouter with full context
-          session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-          const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+          session.conversationHistory.push({
+            role: "user",
+            content: summaryPrompt,
+          });
+          const summaryResponse = await this.queryOpenRouterMultiTurn(
+            session.conversationHistory,
+            apiKey,
+            model,
+            siteUrl,
+            appName,
+            baseUrl,
+          );
 
           let tokensUsed = 0;
           if (summaryResponse.content) {
@@ -236,48 +304,58 @@ export class OpenRouterAgent {
 
           // Process response using shared ResponseProcessor
           await processAgentResponse(
-            summaryResponse.content || '',
+            summaryResponse.content || "",
             session,
             this.dbManager,
             this.sessionManager,
             worker,
             tokensUsed,
             originalTimestamp,
-            'OpenRouter',
-            lastCwd
+            "OpenRouter",
+            lastCwd,
           );
         }
       }
 
       // Mark session complete
       const sessionDuration = Date.now() - session.startTime;
-      logger.success('SDK', 'OpenRouter agent completed', {
+      logger.success("SDK", "OpenRouter agent completed", {
         sessionId: session.sessionDbId,
         duration: `${(sessionDuration / 1000).toFixed(1)}s`,
         historyLength: session.conversationHistory.length,
-        model
+        model,
       });
-
     } catch (error: unknown) {
       if (isAbortError(error)) {
-        logger.warn('SDK', 'OpenRouter agent aborted', { sessionId: session.sessionDbId });
+        logger.warn("SDK", "OpenRouter agent aborted", {
+          sessionId: session.sessionDbId,
+        });
         throw error;
       }
 
       // Check if we should fall back to Claude
       if (shouldFallbackToClaude(error) && this.fallbackAgent) {
-        logger.warn('SDK', 'OpenRouter API failed, falling back to Claude SDK', {
-          sessionDbId: session.sessionDbId,
-          error: error instanceof Error ? error.message : String(error),
-          historyLength: session.conversationHistory.length
-        });
+        logger.warn(
+          "SDK",
+          "OpenRouter API failed, falling back to Claude SDK",
+          {
+            sessionDbId: session.sessionDbId,
+            error: error instanceof Error ? error.message : String(error),
+            historyLength: session.conversationHistory.length,
+          },
+        );
 
         // Fall back to Claude - it will use the same session with shared conversationHistory
         // Note: With claim-and-delete queue pattern, messages are already deleted on claim
         return this.fallbackAgent.startSession(session, worker);
       }
 
-      logger.failure('SDK', 'OpenRouter agent error', { sessionDbId: session.sessionDbId }, error as Error);
+      logger.failure(
+        "SDK",
+        "OpenRouter agent error",
+        { sessionDbId: session.sessionDbId },
+        error as Error,
+      );
       throw error;
     }
   }
@@ -293,15 +371,24 @@ export class OpenRouterAgent {
    * Truncate conversation history to prevent runaway context costs
    * Keeps most recent messages within token budget
    */
-  private truncateHistory(history: ConversationMessage[]): ConversationMessage[] {
+  private truncateHistory(
+    history: ConversationMessage[],
+  ): ConversationMessage[] {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
-    const MAX_CONTEXT_MESSAGES = parseInt(settings.CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES) || DEFAULT_MAX_CONTEXT_MESSAGES;
-    const MAX_ESTIMATED_TOKENS = parseInt(settings.CLAUDE_MEM_OPENROUTER_MAX_TOKENS) || DEFAULT_MAX_ESTIMATED_TOKENS;
+    const MAX_CONTEXT_MESSAGES =
+      parseInt(settings.CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES) ||
+      DEFAULT_MAX_CONTEXT_MESSAGES;
+    const MAX_ESTIMATED_TOKENS =
+      parseInt(settings.CLAUDE_MEM_OPENROUTER_MAX_TOKENS) ||
+      DEFAULT_MAX_ESTIMATED_TOKENS;
 
     if (history.length <= MAX_CONTEXT_MESSAGES) {
       // Check token count even if message count is ok
-      const totalTokens = history.reduce((sum, m) => sum + this.estimateTokens(m.content), 0);
+      const totalTokens = history.reduce(
+        (sum, m) => sum + this.estimateTokens(m.content),
+        0,
+      );
       if (totalTokens <= MAX_ESTIMATED_TOKENS) {
         return history;
       }
@@ -316,18 +403,25 @@ export class OpenRouterAgent {
       const msg = history[i];
       const msgTokens = this.estimateTokens(msg.content);
 
-      if (truncated.length >= MAX_CONTEXT_MESSAGES || tokenCount + msgTokens > MAX_ESTIMATED_TOKENS) {
-        logger.warn('SDK', 'Context window truncated to prevent runaway costs', {
-          originalMessages: history.length,
-          keptMessages: truncated.length,
-          droppedMessages: i + 1,
-          estimatedTokens: tokenCount,
-          tokenLimit: MAX_ESTIMATED_TOKENS
-        });
+      if (
+        truncated.length >= MAX_CONTEXT_MESSAGES ||
+        tokenCount + msgTokens > MAX_ESTIMATED_TOKENS
+      ) {
+        logger.warn(
+          "SDK",
+          "Context window truncated to prevent runaway costs",
+          {
+            originalMessages: history.length,
+            keptMessages: truncated.length,
+            droppedMessages: i + 1,
+            estimatedTokens: tokenCount,
+            tokenLimit: MAX_ESTIMATED_TOKENS,
+          },
+        );
         break;
       }
 
-      truncated.unshift(msg);  // Add to beginning
+      truncated.unshift(msg); // Add to beginning
       tokenCount += msgTokens;
     }
 
@@ -337,10 +431,12 @@ export class OpenRouterAgent {
   /**
    * Convert shared ConversationMessage array to OpenAI-compatible message format
    */
-  private conversationToOpenAIMessages(history: ConversationMessage[]): OpenAIMessage[] {
-    return history.map(msg => ({
-      role: msg.role === 'assistant' ? 'assistant' : 'user',
-      content: msg.content
+  private conversationToOpenAIMessages(
+    history: ConversationMessage[],
+  ): OpenAIMessage[] {
+    return history.map((msg) => ({
+      role: msg.role === "assistant" ? "assistant" : "user",
+      content: msg.content,
     }));
   }
 
@@ -353,51 +449,61 @@ export class OpenRouterAgent {
     apiKey: string,
     model: string,
     siteUrl?: string,
-    appName?: string
+    appName?: string,
+    apiUrl: string = DEFAULT_OPENROUTER_API_URL,
   ): Promise<{ content: string; tokensUsed?: number }> {
     // Truncate history to prevent runaway costs
     const truncatedHistory = this.truncateHistory(history);
     const messages = this.conversationToOpenAIMessages(truncatedHistory);
-    const totalChars = truncatedHistory.reduce((sum, m) => sum + m.content.length, 0);
-    const estimatedTokens = this.estimateTokens(truncatedHistory.map(m => m.content).join(''));
+    const totalChars = truncatedHistory.reduce(
+      (sum, m) => sum + m.content.length,
+      0,
+    );
+    const estimatedTokens = this.estimateTokens(
+      truncatedHistory.map((m) => m.content).join(""),
+    );
 
-    logger.debug('SDK', `Querying OpenRouter multi-turn (${model})`, {
+    logger.debug("SDK", `Querying OpenRouter multi-turn (${model})`, {
       turns: truncatedHistory.length,
       totalChars,
-      estimatedTokens
+      estimatedTokens,
     });
 
-    const response = await fetch(OPENROUTER_API_URL, {
-      method: 'POST',
+    const response = await fetch(apiUrl, {
+      method: "POST",
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': siteUrl || 'https://github.com/thedotmack/claude-mem',
-        'X-Title': appName || 'claude-mem',
-        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": siteUrl || "https://github.com/thedotmack/claude-mem",
+        "X-Title": appName || "claude-mem",
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.3,  // Lower temperature for structured extraction
+        temperature: 0.3, // Lower temperature for structured extraction
         max_tokens: 4096,
       }),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+      throw new Error(
+        `OpenRouter API error: ${response.status} - ${errorText}`,
+      );
     }
 
-    const data = await response.json() as OpenRouterResponse;
+    const data = (await response.json()) as OpenRouterResponse;
 
     // Check for API error in response body
     if (data.error) {
-      throw new Error(`OpenRouter API error: ${data.error.code} - ${data.error.message}`);
+      throw new Error(
+        `OpenRouter API error: ${data.error.code} - ${data.error.message}`,
+      );
     }
 
     if (!data.choices?.[0]?.message?.content) {
-      logger.error('SDK', 'Empty response from OpenRouter');
-      return { content: '' };
+      logger.error("SDK", "Empty response from OpenRouter");
+      return { content: "" };
     }
 
     const content = data.choices[0].message.content;
@@ -408,23 +514,28 @@ export class OpenRouterAgent {
       const inputTokens = data.usage?.prompt_tokens || 0;
       const outputTokens = data.usage?.completion_tokens || 0;
       // Token usage (cost varies by model - many OpenRouter models are free)
-      const estimatedCost = (inputTokens / 1000000 * 3) + (outputTokens / 1000000 * 15);
+      const estimatedCost =
+        (inputTokens / 1000000) * 3 + (outputTokens / 1000000) * 15;
 
-      logger.info('SDK', 'OpenRouter API usage', {
+      logger.info("SDK", "OpenRouter API usage", {
         model,
         inputTokens,
         outputTokens,
         totalTokens: tokensUsed,
         estimatedCostUSD: estimatedCost.toFixed(4),
-        messagesInContext: truncatedHistory.length
+        messagesInContext: truncatedHistory.length,
       });
 
       // Warn if costs are getting high
       if (tokensUsed > 50000) {
-        logger.warn('SDK', 'High token usage detected - consider reducing context', {
-          totalTokens: tokensUsed,
-          estimatedCost: estimatedCost.toFixed(4)
-        });
+        logger.warn(
+          "SDK",
+          "High token usage detected - consider reducing context",
+          {
+            totalTokens: tokensUsed,
+            estimatedCost: estimatedCost.toFixed(4),
+          },
+        );
       }
     }
 
@@ -435,22 +546,38 @@ export class OpenRouterAgent {
    * Get OpenRouter configuration from settings or environment
    * Issue #733: Uses centralized ~/.claude-mem/.env for credentials, not random project .env files
    */
-  private getOpenRouterConfig(): { apiKey: string; model: string; siteUrl?: string; appName?: string } {
+  private getOpenRouterConfig(): {
+    apiKey: string;
+    model: string;
+    baseUrl: string;
+    siteUrl?: string;
+    appName?: string;
+  } {
     const settingsPath = USER_SETTINGS_PATH;
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
     // API key: check settings first, then centralized claude-mem .env (NOT process.env)
     // This prevents Issue #733 where random project .env files could interfere
-    const apiKey = settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY') || '';
+    const apiKey =
+      settings.CLAUDE_MEM_OPENROUTER_API_KEY ||
+      getCredential("OPENROUTER_API_KEY") ||
+      "";
 
     // Model: from settings or default
-    const model = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
+    const model =
+      settings.CLAUDE_MEM_OPENROUTER_MODEL || "xiaomi/mimo-v2-flash:free";
+
+    // Base URL: configurable for local models (Ollama, LM Studio, etc.)
+    // e.g. CLAUDE_MEM_OPENROUTER_BASE_URL=http://localhost:11434/v1
+    const baseUrl = settings.CLAUDE_MEM_OPENROUTER_BASE_URL
+      ? `${settings.CLAUDE_MEM_OPENROUTER_BASE_URL}/chat/completions`
+      : DEFAULT_OPENROUTER_API_URL;
 
     // Optional analytics headers
-    const siteUrl = settings.CLAUDE_MEM_OPENROUTER_SITE_URL || '';
-    const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || 'claude-mem';
+    const siteUrl = settings.CLAUDE_MEM_OPENROUTER_SITE_URL || "";
+    const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || "claude-mem";
 
-    return { apiKey, model, siteUrl, appName };
+    return { apiKey, model, baseUrl, siteUrl, appName };
   }
 }
 
@@ -461,7 +588,10 @@ export class OpenRouterAgent {
 export function isOpenRouterAvailable(): boolean {
   const settingsPath = USER_SETTINGS_PATH;
   const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  return !!(settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY'));
+  return !!(
+    settings.CLAUDE_MEM_OPENROUTER_API_KEY ||
+    getCredential("OPENROUTER_API_KEY")
+  );
 }
 
 /**
@@ -470,5 +600,5 @@ export function isOpenRouterAvailable(): boolean {
 export function isOpenRouterSelected(): boolean {
   const settingsPath = USER_SETTINGS_PATH;
   const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  return settings.CLAUDE_MEM_PROVIDER === 'openrouter';
+  return settings.CLAUDE_MEM_PROVIDER === "openrouter";
 }
